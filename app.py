@@ -2,119 +2,174 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+import pandas_datareader.data as web
 from datetime import datetime, timedelta
 
-# --- 页面配置 ---
-st.set_page_config(page_title="宏观流动性观测仪", layout="wide")
+# --- 配置 ---
+st.set_page_config(page_title="宏观流动性回测系统 Pro", layout="wide")
+st.title("🔬 宏观流动性 vs 崩盘归因分析系统 (Pro Ver.)")
 
-st.title("🌊 宏观流动性 vs AI叙事 观测模型")
-st.markdown("Based on XinGPT Logic: **The Crash is about Liquidity (JPY Carry Trade), not AI.**")
+# --- 侧边栏 ---
+st.sidebar.header("回测参数")
+years_back = st.sidebar.slider("回溯年份", 1, 5, 3)
+start_date = datetime.now() - timedelta(days=years_back*365)
+st.sidebar.markdown("---")
+st.sidebar.info("数据源: Yahoo Finance (市场) + FRED (美联储)")
 
-# --- 侧边栏配置 ---
-st.sidebar.header("参数设置")
-days_back = st.sidebar.selectbox("观测时间窗口", ["1mo", "3mo", "6mo", "1y", "ytd"], index=1)
-st.sidebar.info("数据来源: Yahoo Finance (约15分钟延迟)")
-
-# --- 核心数据定义 ---
-# 字典格式: {"显示名称": "Yahoo代码"}
-ASSETS = {
-    "🇯🇵 日元汇率 (JPY=X)": "JPY=X",   # USD/JPY: 下跌代表日元升值(流动性紧缩)
-    "🇺🇸 10年美债 (US10Y)": "^TNX",    # 无风险利率
-    "😨 恐慌指数 (VIX)": "^VIX",      # 市场恐慌度
-    "📉 纳斯达克 (Nasdaq)": "^IXIC",  # 科技股整体
-    "☁️ SaaS软件 (IGV)": "IGV",       # 被认为"受AI冲击"的板块
-    "🤖 英伟达 (NVDA)": "NVDA"        # AI 信仰核心
-}
-
-# --- 数据获取函数 (带缓存，防止重复下载) ---
-@st.cache_data(ttl=300) # 缓存5分钟
-def get_market_data(period):
-    tickers = list(ASSETS.values())
-    # 批量下载数据
-    data = yf.download(tickers, period=period, progress=False)['Close']
+# --- 核心数据获取 (Yahoo + FRED) ---
+@st.cache_data(ttl=3600)
+def get_macro_data(start):
+    # 1. 获取市场数据 (Yahoo)
+    market_tickers = {
+        "Nasdaq": "^IXIC",          # 科技股
+        "USD_JPY": "JPY=X",         # 日元汇率 (流动性反向指标)
+        "BTC": "BTC-USD",           # 流动性敏锐度
+        "VIX": "^VIX"               # 恐慌
+    }
+    market_data = yf.download(list(market_tickers.values()), start=start, progress=False)['Close']
+    # 修复 MultiIndex 问题
+    if isinstance(market_data.columns, pd.MultiIndex):
+        market_data.columns = market_data.columns.get_level_values(0)
     
-    # yfinance 有时会返回多层索引，这里做一下清洗
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+    # 重命名
+    inv_map = {v: k for k, v in market_tickers.items()}
+    market_data = market_data.rename(columns=inv_map)
     
-    # 重命名列名为易读名称
-    rename_map = {v: k for k, v in ASSETS.items()}
-    data = data.rename(columns=rename_map)
-    
-    # 填充空值（用前值填充）
-    data = data.ffill().dropna()
-    return data
+    # 2. 获取美联储数据 (FRED - St. Louis Fed)
+    # WALCL: 美联储总资产
+    # WTREGEN: 财政部账户 (TGA)
+    # RRPONTSYD: 逆回购 (RRP)
+    try:
+        fred_tickers = ['WALCL', 'WTREGEN', 'RRPONTSYD']
+        fred_data = web.DataReader(fred_tickers, 'fred', start, datetime.now())
+        
+        # 3. 数据合并与对齐
+        # FRED数据是周/日频不一，需要填充对齐到市场交易日
+        df = market_data.join(fred_data, how='outer').ffill().dropna()
+        
+        # 4. 计算"净流动性" (Net Liquidity)
+        # 单位换算成十亿 (Billions)
+        # 公式: Net Liquidity = Fed Balance Sheet - TGA - RRP
+        df['Net_Liquidity'] = (df['WALCL'] - df['WTREGEN'] - df['RRPONTSYD']) / 1000
+        
+        return df
+    except Exception as e:
+        st.error(f"FRED 数据获取失败: {e}")
+        return market_data
 
-# --- 加载数据 ---
-try:
-    df = get_market_data(days_back)
-    
-    # 计算最新价格和涨跌幅
-    latest_price = df.iloc[-1]
-    prev_price = df.iloc[-2]
-    pct_change = (latest_price - prev_price) / prev_price
+df = get_macro_data(start_date)
 
-    # --- 第一部分：关键指标仪表盘 ---
-    st.subheader("📊 实时压力指标")
-    col1, col2, col3, col4 = st.columns(4)
+# --- 逻辑分析层 ---
+# 计算相关性与归一化
+normalized_df = (df - df.min()) / (df.max() - df.min()) # Min-Max 归一化用于绘图
+corr_matrix = df.corr()
+
+# --- 界面展示 ---
+
+# Tab 1: 深度图表分析
+tab1, tab2, tab3 = st.tabs(["📈 深度趋势对比", "⚠️ 预警信号回测", "🧮 原始数据"])
+
+with tab1:
+    st.subheader("流动性 vs 资产价格历史走势")
+    col1, col2 = st.columns([3, 1])
     
     with col1:
-        name = "🇯🇵 日元汇率 (JPY=X)"
-        val = latest_price[name]
-        chg = pct_change[name]
-        st.metric(name, f"{val:.2f}", f"{chg:.2%}", delta_color="inverse") 
-        st.caption("注：此值大跌 = 日元升值 = 流动性危机")
-
-    with col2:
-        name = "🇺🇸 10年美债 (US10Y)"
-        val = latest_price[name]
-        chg = pct_change[name]
-        st.metric(name, f"{val:.2f}", f"{chg:.2%}", delta_color="inverse")
-
-    with col3:
-        name = "📉 纳斯达克 (Nasdaq)"
-        val = latest_price[name]
-        chg = pct_change[name]
-        st.metric(name, f"{val:.0f}", f"{chg:.2%}")
-
-    with col4:
-        name = "☁️ SaaS软件 (IGV)"
-        val = latest_price[name]
-        chg = pct_change[name]
-        st.metric(name, f"{val:.2f}", f"{chg:.2%}")
-
-    # --- 第二部分：核心逻辑验证图表 ---
-    st.divider()
-    st.subheader("🧐 核心验证：谁在主导下跌？")
-    
-    # 数据归一化（Normalize），让所有资产从起点(0%)开始比较
-    normalized_df = (df / df.iloc[0] - 1) * 100
-    
-    assets_to_plot = st.multiselect(
-        "选择对比资产 (默认对比日元汇率与纳斯达克)",
-        list(ASSETS.keys()),
-        default=["🇯🇵 日元汇率 (JPY=X)", "📉 纳斯达克 (Nasdaq)", "☁️ SaaS软件 (IGV)"]
-    )
-    
-    if assets_to_plot:
+        # 双轴图表：左轴是价格，右轴是流动性
         fig = go.Figure()
-        for asset in assets_to_plot:
-            fig.add_trace(go.Scatter(x=normalized_df.index, y=normalized_df[asset], mode='lines', name=asset))
         
+        # 资产端 (左轴)
+        fig.add_trace(go.Scatter(x=df.index, y=df['Nasdaq'], name="Nasdaq Index", line=dict(color='cyan', width=2)))
+        
+        # 流动性端 (右轴) - 美联储净流动性
+        fig.add_trace(go.Scatter(x=df.index, y=df['Net_Liquidity'], name="Fed Net Liquidity (B$)", 
+                                 line=dict(color='orange', dash='dot'), yaxis='y2'))
+        
+        # 辅助线 - 日元 (右轴)
+        fig.add_trace(go.Scatter(x=df.index, y=df['USD_JPY'], name="USD/JPY (汇率)", 
+                                 line=dict(color='red', width=1), yaxis='y2', visible='legendonly'))
+
         fig.update_layout(
-            title=f"过去 {days_back} 走势对比 (归一化 %)",
-            xaxis_title="日期",
-            yaxis_title="累计涨跌幅 (%)",
-            hovermode="x unified"
+            title="美联储净流动性 vs 纳斯达克 (这就是'真钱'去向)",
+            yaxis=dict(title="Nasdaq Index"),
+            yaxis2=dict(title="Liquidity / JPY", overlaying='y', side='right'),
+            hovermode="x unified",
+            height=500
         )
         st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.write("#### 核心相关性矩阵")
+        st.write("看 **Nasdaq** 与谁的关系最铁？")
+        # 重点展示 Nasdaq 与各因子的相关性
+        target_corr = corr_matrix['Nasdaq'].sort_values(ascending=False)
+        st.dataframe(target_corr.style.background_gradient(cmap='RdYlGn'))
+        st.info("💡 **解读**: 如果Net_Liquidity相关性高，说明是央行放水驱动；如果USD_JPY正相关性极高(>0.8)，说明是套利交易驱动。")
 
-    # --- 第三部分：结论区 ---
-    st.info("""
-    **如何解读？**
-    1. **流动性危机模式：** 如果 `日元汇率` 线条大幅向下（升值），且 `纳斯达克` 同步向下。 -> 验证 XinGPT 观点。
-    2. **AI 泡沫破裂模式：** 如果 `日元汇率` 平稳，但 `SaaS软件` 和 `纳斯达克` 独自暴跌。 -> 可能是 AI 替代逻辑或行业内因。
-    """)
+with tab2:
+    st.subheader("🕵️‍♀️ 危机预警回测 (Backtesting Signals)")
+    st.markdown("我们定义一个**'流动性冲击信号'**: 当 USD/JPY 在 10 天内快速升值（数值下跌）超过 3%，视为流动性抽离。")
 
-except Exception as e:
-    st.error(f"数据加载失败，可能是 Yahoo Finance 暂时限流，请稍后刷新页面。错误信息: {e}")
+    # --- 信号计算 ---
+    # 计算 USD/JPY 10天变化率
+    df['JPY_Chg_10d'] = df['USD_JPY'].pct_change(10)
+    
+    # 触发信号：USD/JPY 跌幅超过 3% (即日元升值3%)
+    signals = df[df['JPY_Chg_10d'] < -0.03].index
+    
+    # 寻找信号后的纳斯达克表现
+    results = []
+    for date in signals:
+        try:
+            # 获取信号当天的价格
+            price_at_signal = df.loc[date]['Nasdaq']
+            # 获取信号后 20 天的价格（如果没有20天后的数据则跳过）
+            target_date = date + timedelta(days=20)
+            if target_date > df.index[-1]:
+                continue
+            idx_loc = df.index.get_indexer([target_date], method='nearest')[0]
+            price_after_20d = df.iloc[idx_loc]['Nasdaq']
+            
+            drawdown = (price_after_20d - price_at_signal) / price_at_signal
+            results.append({
+                "信号日期": date.strftime('%Y-%m-%d'),
+                "USD/JPY 10天跌幅": f"{df.loc[date]['JPY_Chg_10d']:.2%}",
+                "Nasdaq 当前价格": f"{price_at_signal:.0f}",
+                "20天后涨跌幅": drawdown
+            })
+        except:
+            pass
+            
+    res_df = pd.DataFrame(results)
+    
+    col_a, col_b = st.columns([2, 1])
+    
+    with col_a:
+        # 绘制信号点图
+        fig_sig = go.Figure()
+        fig_sig.add_trace(go.Scatter(x=df.index, y=df['Nasdaq'], name="Nasdaq"))
+        # 标记信号点
+        y_vals = df.loc[signals]['Nasdaq']
+        fig_sig.add_trace(go.Scatter(
+            x=signals, y=y_vals, mode='markers', name='流动性警报',
+            marker=dict(color='red', size=10, symbol='triangle-down')
+        ))
+        st.plotly_chart(fig_sig, use_container_width=True)
+        
+    with col_b:
+        st.write("#### 历史警报列表")
+        if not res_df.empty:
+            # 格式化颜色
+            def color_negative_red(val):
+                color = 'red' if val < 0 else 'green'
+                return f'color: {color}'
+            
+            st.dataframe(
+                res_df.style.format({'20天后涨跌幅': '{:.2%}'})
+                .applymap(lambda x: 'color: red' if isinstance(x, float) and x < 0 else 'color: green', subset=['20天后涨跌幅']),
+                height=400
+            )
+        else:
+            st.write("过去几年未触发极端流动性警报。")
+
+with tab3:
+    st.dataframe(df.tail(50))
