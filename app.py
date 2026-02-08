@@ -21,41 +21,27 @@ st.sidebar.info("数据源: Yahoo Finance + FRED (修复版)")
 
 # --- 核心辅助函数：稳健获取 FRED 数据 ---
 def fetch_fred_series(series_id, start_date_str):
-    """
-    尝试从 FRED 获取数据，如果失败返回空 Series，
-    并强制转换为无时区格式以匹配 Yahoo 数据。
-    """
     try:
-        # 使用 FRED 的直接下载接口
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start_date_str}"
-        
-        # 伪装成浏览器请求，防止被 FRED 拦截
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code == 200:
-            # 读取 CSV
             df = pd.read_csv(io.StringIO(response.text), index_col=0, parse_dates=True)
-            
-            # 确保索引是 DatetimeIndex
             df.index = pd.to_datetime(df.index)
-            
-            # 关键修复：强制去除时区信息 (Make TZ-naive)
+            # 强制去除时区信息
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
-                
             return df
         else:
-            st.warning(f"FRED 接口返回状态码 {response.status_code}: {series_id}")
             return pd.DataFrame()
     except Exception as e:
-        st.warning(f"无法获取 FRED 数据 {series_id}: {e}")
         return pd.DataFrame()
 
 # --- 核心数据逻辑 ---
 @st.cache_data(ttl=3600)
 def get_macro_data(start_str):
-    # 1. 获取市场数据 (Yahoo)
+    # 1. 获取市场数据
     market_tickers = {
         "Nasdaq": "^IXIC",          
         "USD_JPY": "JPY=X",         
@@ -63,15 +49,13 @@ def get_macro_data(start_str):
         "VIX": "^VIX"               
     }
     
-    # 下载数据
     market_data = yf.download(list(market_tickers.values()), start=start_str, progress=False)['Close']
     
-    # 清洗 Yahoo 数据格式 (处理 MultiIndex)
+    # 清洗 Yahoo 数据
     if isinstance(market_data.columns, pd.MultiIndex):
         market_data.columns = market_data.columns.get_level_values(0)
     
-    # 关键修复：强制去除 Yahoo 数据的时区信息
-    # 这一步解决了 "Cannot compare dtypes" 错误
+    # 强制去除 Yahoo 时区
     if market_data.index.tz is not None:
         market_data.index = market_data.index.tz_localize(None)
     
@@ -79,52 +63,41 @@ def get_macro_data(start_str):
     market_data = market_data.rename(columns=inv_map)
     
     # 2. 获取美联储数据
-    # WALCL: 总资产, WTREGEN: TGA, RRPONTSYD: 逆回购
     fred_ids = {'WALCL': 'WALCL', 'WTREGEN': 'WTREGEN', 'RRPONTSYD': 'RRPONTSYD'}
     fred_frames = {}
     
     for key, series_id in fred_ids.items():
         data = fetch_fred_series(series_id, start_str)
-        # 如果获取到了数据，取第一列（通常是数值列）
         if not data.empty:
             fred_frames[key] = data.iloc[:, 0]
         else:
-            # 如果失败，生成一个全 NaN 的 Series，防止代码崩溃
             fred_frames[key] = pd.Series(index=market_data.index, dtype=float)
 
-    # 3. 数据对齐与合并
-    # 创建一个新的 DataFrame 用于存放对齐后的 FRED 数据
+    # 3. 对齐与合并
     fred_aligned = pd.DataFrame(index=market_data.index)
-    
-    # 将 FRED 数据 (通常是周度/月度) 填充到 市场数据 (日度)
-    # 使用 reindex + ffill (前值填充)
     for key, series in fred_frames.items():
-        # 这里因为双方都已经去除了时区，reindex 不会再报错
         fred_aligned[key] = series.reindex(market_data.index, method='ffill')
     
-    # 合并
     df = market_data.join(fred_aligned).ffill().dropna()
     
-    # 4. 计算净流动性 (Net Liquidity)
-    # 逻辑：有些 FRED 数据单位是 Million，有些是 Billion
-    # WALCL (Millions) -> /1000 -> Billions
-    # WTREGEN (Billions) -> 保持
-    # RRPONTSYD (Billions) -> 保持
-    
-    # 容错处理：确保列存在且不是全空
+    # 4. 计算净流动性
     if 'WALCL' in df.columns and 'WTREGEN' in df.columns:
+        # 单位统一为 Billions
         df['Net_Liquidity'] = (df['WALCL']/1000 - df['WTREGEN'] - df['RRPONTSYD'])
     else:
-        df['Net_Liquidity'] = 0  # 数据缺失时的默认值
+        df['Net_Liquidity'] = 0
     
     return df
 
 # 执行获取
-df = get_macro_data(start_date_str)
+try:
+    df = get_macro_data(start_date_str)
+except Exception as e:
+    st.error(f"数据处理发生严重错误: {e}")
+    st.stop()
 
-# --- 容错检查：如果数据全空 ---
 if df.empty:
-    st.error("数据下载完全失败，请检查网络或稍后重试。")
+    st.error("未获取到有效数据，请稍后重试。")
     st.stop()
 
 # --- 逻辑分析层 ---
@@ -141,7 +114,6 @@ with tab1:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.index, y=df['Nasdaq'], name="Nasdaq Index", line=dict(color='cyan', width=2)))
         
-        # 只有在成功计算了流动性时才显示
         if df['Net_Liquidity'].sum() != 0:
             fig.add_trace(go.Scatter(x=df.index, y=df['Net_Liquidity'], name="Fed Net Liquidity (B$)", 
                                      line=dict(color='orange', dash='dot'), yaxis='y2'))
@@ -163,7 +135,9 @@ with tab1:
         st.write("#### 核心相关性矩阵")
         if 'Nasdaq' in corr_matrix.columns:
             target_corr = corr_matrix['Nasdaq'].sort_values(ascending=False)
-            st.dataframe(target_corr.style.background_gradient(cmap='RdYlGn'))
+            # --- 修复点：将 Series 转为 DataFrame 再应用样式 ---
+            target_corr_df = target_corr.to_frame(name="Correlation")
+            st.dataframe(target_corr_df.style.background_gradient(cmap='RdYlGn'))
 
 with tab2:
     st.subheader("🕵️‍♀️ 危机预警回测 (Backtesting Signals)")
@@ -180,7 +154,6 @@ with tab2:
                 target_date = date + timedelta(days=20)
                 if target_date > df.index[-1]: continue
                 
-                # 寻找最近交易日
                 idx_loc = df.index.get_indexer([target_date], method='nearest')[0]
                 price_after_20d = df.iloc[idx_loc]['Nasdaq']
                 
@@ -206,6 +179,7 @@ with tab2:
             st.plotly_chart(fig_sig, use_container_width=True)
         with col_b:
             if not res_df.empty:
+                # 同样的修复：应用样式前确保它是 DataFrame（虽然 res_df 本身就是 DataFrame，这里安全起见）
                 st.dataframe(res_df.style.format({'USD/JPY 10天跌幅': '{:.2%}', 'Nasdaq 20天后表现': '{:.2%}'})
                              .applymap(lambda x: 'color: red' if x < 0 else 'color: green', subset=['Nasdaq 20天后表现']))
             else:
